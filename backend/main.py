@@ -4,11 +4,22 @@ from sqlalchemy.orm import Session
 from typing import List
 import json
 import uvicorn
+import logging
+import signal
+import sys
 
 import models
 import database
 import schemas
 from execution_engine import ExecutionEngine
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Serverless Function Platform")
 
@@ -76,14 +87,18 @@ def delete_function(function_id: int, db: Session = Depends(get_db)):
 
 @app.post("/functions/{function_id}/execute")
 def execute_function(function_id: int, input_data: dict, db: Session = Depends(get_db)):
+    logger.info(f"Received request to execute function {function_id}")
     function = db.query(models.Function).filter(models.Function.id == function_id).first()
     if function is None:
+        logger.warning(f"Function {function_id} not found")
         raise HTTPException(status_code=404, detail="Function not found")
     
     try:
+        logger.info(f"Starting execution of function {function_id} with input: {input_data}")
         result = execution_engine.execute_function(str(function_id), function.code, input_data)
         
         # Store metrics
+        logger.info(f"Storing metrics for function {function_id}")
         metrics = models.FunctionMetrics(
             function_id=function_id,
             execution_time=result["metrics"]["execution_time"],
@@ -94,9 +109,11 @@ def execute_function(function_id: int, input_data: dict, db: Session = Depends(g
         )
         db.add(metrics)
         db.commit()
+        logger.info(f"Function {function_id} executed successfully")
         
         return result
     except Exception as e:
+        logger.error(f"Error executing function {function_id}: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/functions/{function_id}/metrics")
@@ -106,5 +123,23 @@ def get_function_metrics(function_id: int, db: Session = Depends(get_db)):
     ).order_by(models.FunctionMetrics.timestamp.desc()).all()
     return metrics
 
+# Setup shutdown handler for container cleanup
+def cleanup_on_shutdown(signum, frame):
+    logger.info("Received shutdown signal, cleaning up all containers...")
+    for function_id in list(execution_engine.container_pool.keys()):
+        try:
+            logger.info(f"Cleaning up container for function {function_id}")
+            execution_engine.cleanup(function_id)
+        except Exception as e:
+            logger.error(f"Error cleaning up container for function {function_id}: {str(e)}")
+    logger.info("All containers cleaned up, shutting down")
+    sys.exit(0)
+
+# Register signal handlers
+signal.signal(signal.SIGINT, cleanup_on_shutdown)
+signal.signal(signal.SIGTERM, cleanup_on_shutdown)
+
 if __name__ == "__main__":
+    logger.info("Starting Serverless Function Platform API")
+    logger.info("Press Ctrl+C to shutdown and cleanup all containers")
     uvicorn.run(app, host="0.0.0.0", port=8000) 

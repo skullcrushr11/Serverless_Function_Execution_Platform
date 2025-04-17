@@ -79,7 +79,8 @@ const FunctionDetail = () => {
                 variant="outlined"
                 sx={{
                   p: 2,
-                  bgcolor: '#f5f5f5',
+                  bgcolor: '#1e1e1e',
+                  color: '#ffffff',
                   fontFamily: 'monospace',
                   whiteSpace: 'pre-wrap',
                 }}
