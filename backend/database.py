@@ -6,7 +6,7 @@ import os
 # Default MySQL connection string for Windows
 SQLALCHEMY_DATABASE_URL = os.getenv(
     "DATABASE_URL",
-    "mysql+pymysql://<username>:<passsword>@localhost:3306/serverless_platform?charset=utf8mb4"
+    "mysql+pymysql://<username>:<password>@localhost:3306/serverless_platform?charset=utf8mb4"
 )
 
 # Create engine with Windows-specific settings
