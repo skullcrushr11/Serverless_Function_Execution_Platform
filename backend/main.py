@@ -95,7 +95,12 @@ def execute_function(function_id: int, input_data: dict, db: Session = Depends(g
     
     try:
         logger.info(f"Starting execution of function {function_id} with input: {input_data}")
-        result = execution_engine.execute_function(str(function_id), function.code, input_data)
+        result = execution_engine.execute_function(
+            str(function_id), 
+            function.code, 
+            input_data,
+            language=function.language
+        )
         
         # Store metrics
         logger.info(f"Storing metrics for function {function_id}")

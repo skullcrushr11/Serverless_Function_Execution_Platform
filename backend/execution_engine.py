@@ -47,6 +47,15 @@ class ExecutionEngine:
                 logger.info("Pulling Python 3.9 image...")
                 self.docker_client.images.pull('python:3.9')
                 logger.info("Python 3.9 image pulled successfully")
+            
+            # Ensure Node.js image is available
+            try:
+                self.docker_client.images.get('node:18')
+                logger.info("Node.js 18 image is already available")
+            except docker.errors.ImageNotFound:
+                logger.info("Pulling Node.js 18 image...")
+                self.docker_client.images.pull('node:18')
+                logger.info("Node.js 18 image pulled successfully")
                 
         except Exception as e:
             logger.error(f"Docker initialization error: {str(e)}")
@@ -93,17 +102,37 @@ class ExecutionEngine:
             logger.error(f"Error creating container: {str(e)}")
             raise RuntimeError(f"Failed to create Docker container: {str(e)}")
 
-    def execute_function(self, function_id: str, code: str, input_data: Dict[str, Any]) -> Dict[str, Any]:
+    def execute_function(self, function_id: str, code: str, input_data: Dict[str, Any], language: str = "python") -> Dict[str, Any]:
         """Execute a function in a container."""
         start_time = time.time()
-        logger.info(f"Starting execution of function {function_id}")
+        logger.info(f"Starting execution of function {function_id} using language: {language}")
         
         try:
-            # Get or create container
+            # Get or create container based on language
             container_id = self.container_pool.get(function_id)
+            
+            # If container exists but might be for a different language, remove it
+            if container_id:
+                try:
+                    container = self.docker_client.containers.get(container_id)
+                    if language == "python" and not container.image.tags[0].startswith("python:"):
+                        logger.info(f"Container {container_id} is not a Python container. Cleaning up.")
+                        self.cleanup(function_id)
+                        container_id = None
+                    elif language == "javascript" and not container.image.tags[0].startswith("node:"):
+                        logger.info(f"Container {container_id} is not a Node.js container. Cleaning up.")
+                        self.cleanup(function_id)
+                        container_id = None
+                except Exception as e:
+                    logger.warning(f"Error checking container image: {str(e)}")
+                    self.cleanup(function_id)
+                    container_id = None
+            
+            # Create new container if needed
             if not container_id:
                 logger.info(f"No existing container found for function {function_id}")
-                container_id = self.create_container(function_id, "python:3.9")
+                image = "python:3.9" if language == "python" else "node:18"
+                container_id = self.create_container(function_id, image)
                 self.container_pool[function_id] = container_id
                 logger.info(f"Added container {container_id} to pool for function {function_id}")
             else:
@@ -113,8 +142,9 @@ class ExecutionEngine:
             container = self.docker_client.containers.get(container_id)
             logger.info(f"Retrieved container {container.id} for execution")
             
-            # Create a proper Python script with the function code
-            wrapper_script = f"""#!/usr/bin/env python3
+            if language == "python":
+                # Create a proper Python script with the function code
+                wrapper_script = f"""#!/usr/bin/env python3
 import json
 import sys
 import os
@@ -143,50 +173,90 @@ if __name__ == "__main__":
         print(json.dumps({{"error": str(e)}}))
         print("##RESULT_END##")
 """
+                # Create a temp file with the script
+                with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f:
+                    f.write(wrapper_script)
+                    temp_file = f.name
+                
+                # Copy code to container
+                container.exec_run("mkdir -p /tmp")
+                try:
+                    # Create a tar archive with the file
+                    with tempfile.NamedTemporaryFile(suffix='.tar') as tar_file:
+                        with tarfile.open(fileobj=tar_file, mode='w') as tar:
+                            tar.add(temp_file, arcname='function.py')
+                        tar_file.flush()
+                        tar_file.seek(0)
+                        # Copy the archive to the container
+                        container.put_archive('/tmp', tar_file.read())
+                        
+                    # Make the script executable
+                    container.exec_run("chmod +x /tmp/function.py")
+                finally:
+                    # Clean up temp file
+                    os.unlink(temp_file)
+                
+                # Execute with better debugging
+                exec_result = container.exec_run(
+                    "bash -c 'echo \"INPUT=$INPUT\" && python /tmp/function.py'",
+                    environment={"INPUT": json.dumps(input_data)}
+                )
             
-            # Copy code to container with proper escaping
-            container.exec_run("mkdir -p /tmp")
-            logger.info(f"Writing function code to container {container.id}")
+            elif language == "javascript":
+                # Create a Node.js script with the function code
+                wrapper_script = f"""// User function code
+{code}
+
+// Main execution
+(async () => {{
+    try {{
+        // Get input data from environment variable
+        const inputStr = process.env.INPUT || '{{}}';
+        const inputData = JSON.parse(inputStr);
+        
+        // Execute the function
+        const result = await main(inputData);
+        
+        // Print the result as JSON
+        console.log("\\n##RESULT_START##");
+        console.log(JSON.stringify({{ result }}));
+        console.log("##RESULT_END##");
+    }} catch (error) {{
+        console.error(error);
+        console.log("\\n##RESULT_START##");
+        console.log(JSON.stringify({{ error: error.message }}));
+        console.log("##RESULT_END##");
+    }}
+}})();
+"""
+                # Create a temp file with the script
+                with tempfile.NamedTemporaryFile(mode='w', suffix='.js', delete=False) as f:
+                    f.write(wrapper_script)
+                    temp_file = f.name
+                
+                # Copy code to container
+                container.exec_run("mkdir -p /tmp")
+                try:
+                    # Create a tar archive with the file
+                    with tempfile.NamedTemporaryFile(suffix='.tar') as tar_file:
+                        with tarfile.open(fileobj=tar_file, mode='w') as tar:
+                            tar.add(temp_file, arcname='function.js')
+                        tar_file.flush()
+                        tar_file.seek(0)
+                        # Copy the archive to the container
+                        container.put_archive('/tmp', tar_file.read())
+                finally:
+                    # Clean up temp file
+                    os.unlink(temp_file)
+                
+                # Execute with Node.js
+                exec_result = container.exec_run(
+                    "bash -c 'echo \"INPUT=$INPUT\" && node /tmp/function.js'",
+                    environment={"INPUT": json.dumps(input_data)}
+                )
+            else:
+                raise ValueError(f"Unsupported language: {language}")
             
-            # Write to file in chunks to avoid command line length limits
-            script_lines = wrapper_script.split('\n')
-            container.exec_run("rm -f /tmp/function.py")
-            
-            # Create a temp file with the script
-            with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f:
-                f.write(wrapper_script)
-                temp_file = f.name
-            
-            try:
-                # Create a tar archive with the file
-                with tempfile.NamedTemporaryFile(suffix='.tar') as tar_file:
-                    with tarfile.open(fileobj=tar_file, mode='w') as tar:
-                        tar.add(temp_file, arcname='function.py')
-                    tar_file.flush()
-                    tar_file.seek(0)
-                    # Copy the archive to the container
-                    container.put_archive('/tmp', tar_file.read())
-                    
-                # Make the script executable
-                container.exec_run("chmod +x /tmp/function.py")
-            finally:
-                # Clean up temp file
-                os.unlink(temp_file)
-            
-            # Execute function
-            logger.info(f"Executing function in container {container.id}")
-            input_json = json.dumps(input_data)
-            logger.info(f"Input data: {input_json}")
-            
-            # Verify the function code in the container
-            inspect_cmd = container.exec_run("cat /tmp/function.py")
-            logger.info(f"Function code in container: \n{inspect_cmd.output.decode()[:200]}...")
-            
-            # Execute with better debugging
-            exec_result = container.exec_run(
-                "bash -c 'echo \"INPUT=$INPUT\" && python /tmp/function.py'",
-                environment={"INPUT": input_json}
-            )
             logger.info(f"Function execution completed with exit code: {exec_result.exit_code}")
             
             # Collect metrics
